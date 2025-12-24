@@ -1,12 +1,14 @@
 <?php
 /**
  * Plugin Name: Free WebP Optimizer by thisismyurl
- * Description: Non-destructive WebP conversion with backups, undo, and live savings reports.
+ * Description: Non-destructive WebP conversion with backups, live categorization, and one-click restoration.
  * Version: 1.251224
  * Author: thisismyurl
  * Author URI: https://thisismyurl.com/
  * License: GPLv2 or later
  * Text Domain: free-webp-optimizer-thisismyurl
+ * GitHub Plugin URI: https://github.com/thisismyurl/free-webp-optimizer-thisismyurl
+ * Primary Branch: main
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -14,39 +16,51 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * SECTION 1: ASSETS & DATA FETCHING
+ * SECTION 1: CORE ENGINE (CONVERSION & RESTORATION)
  */
-function fwo_enqueue_admin_assets( $hook ) {
-	if ( 'tools_page_webp-optimizer' !== $hook ) {
-		return;
-	}
-
-	wp_enqueue_style( 'fwo-admin-styles', plugin_dir_url( __FILE__ ) . 'free-webp-optimizer-thisismyurl.css', array(), '1.251224' );
-	wp_enqueue_script( 'fwo-admin-js', plugin_dir_url( __FILE__ ) . 'free-webp-optimizer-thisismyurl.js', array( 'jquery' ), '1.251224', true );
-
-	// Fetch pending images using WP_Query (No direct SQL)
-	$pending_query = new WP_Query( array(
+function fwo_get_media_lists() {
+	$query = new WP_Query( array(
 		'post_type'      => 'attachment',
 		'post_status'    => 'inherit',
 		'posts_per_page' => -1,
-		'fields'         => 'ids',
-		'post_mime_type' => array( 'image/jpeg', 'image/png' ),
 		'no_found_rows'  => true,
 	) );
 
-	wp_localize_script( 'fwo-admin-js', 'fwoVars', array(
-		'ajaxurl'    => admin_url( 'admin-ajax.php' ),
-		'nonce'      => wp_create_nonce( 'fwo_webp_nonce' ),
-		'pendingIds' => array_map( 'intval', $pending_query->posts ),
-		'msgError'   => esc_html__( 'Failed to restore image #', 'free-webp-optimizer-thisismyurl' ),
-		'msgConfirm' => esc_html__( 'Restore original files? This cannot be undone.', 'free-webp-optimizer-thisismyurl' ),
-	) );
-}
-add_action( 'admin_enqueue_scripts', 'fwo_enqueue_admin_assets' );
+	$pending = array();
+	$media   = array();
 
-/**
- * SECTION 2: CONVERSION ENGINE (WP_FILESYSTEM API)
- */
+	if ( $query->posts ) {
+		foreach ( $query->posts as $post ) {
+			$file         = get_attached_file( $post->ID );
+			$mime         = get_post_mime_type( $post->ID );
+			$is_webp      = ( 'image/webp' === $mime || strtolower(pathinfo($file, PATHINFO_EXTENSION)) === 'webp' );
+			$is_optimizable = in_array( $mime, array( 'image/jpeg', 'image/png', 'image/gif', 'image/bmp' ) );
+			$orig_path    = get_post_meta( $post->ID, '_webp_original_path', true );
+			$exists       = file_exists( $file );
+
+			// Mark existing WebP files as externally managed
+			if ( $is_webp && ! $orig_path ) {
+				update_post_meta( $post->ID, '_webp_original_path', 'external' );
+				$orig_path = 'external';
+			}
+
+			// If file missing, move to second list with special status
+			if ( ! $exists ) {
+				$post->fwo_status = 'missing';
+				$media[] = $post;
+				continue;
+			}
+
+			if ( $orig_path || $is_webp || ! $is_optimizable ) {
+				$media[] = $post;
+			} else {
+				$pending[] = $post;
+			}
+		}
+	}
+	return array( 'pending' => $pending, 'media' => $media );
+}
+
 function fwo_init_filesystem() {
 	global $wp_filesystem;
 	if ( empty( $wp_filesystem ) ) {
@@ -60,232 +74,266 @@ function fwo_convert_to_webp( $attachment_id, $quality = 80 ) {
 	$wp_fs     = fwo_init_filesystem();
 	$full_path = get_attached_file( $attachment_id );
 
-	if ( ! $full_path || ! $wp_fs->exists( $full_path ) ) {
-		return false;
-	}
-
+	if ( ! $full_path || ! $wp_fs->exists( $full_path ) ) return new WP_Error('missing','File missing.');
 	$info = getimagesize( $full_path );
-	if ( ! $info || ! in_array( $info['mime'], array( 'image/jpeg', 'image/png' ) ) ) {
-		return false;
-	}
+	if ( ! $info ) return new WP_Error('info','Invalid image.');
 
 	$original_size = filesize( $full_path );
-	$new_path      = preg_replace( '/\.(jpg|jpeg|png)$/i', '.webp', $full_path );
+	$new_path      = preg_replace( '/\.(jpg|jpeg|png|gif|bmp)$/i', '.webp', $full_path );
 
-	switch ( $info['mime'] ) {
-		case 'image/jpeg':
-			$image = imagecreatefromjpeg( $full_path );
-			break;
-		case 'image/png':
-			$image = imagecreatefrompng( $full_path );
-			if ( $image ) {
-				imagepalettetotruecolor( $image );
-				imagealphablending( $image, true );
-				imagesavealpha( $image, true );
-			}
-			break;
-	}
+	if ( 'image/jpeg' === $info['mime'] ) $image = imagecreatefromjpeg( $full_path );
+	elseif ( 'image/png' === $info['mime'] ) {
+		$image = imagecreatefrompng( $full_path );
+		if ( $image ) { imagepalettetotruecolor($image); imagealphablending($image, true); imagesavealpha($image, true); }
+	} elseif ( 'image/gif' === $info['mime'] ) $image = imagecreatefromgif( $full_path );
+	elseif ( 'image/bmp' === $info['mime'] ) $image = imagecreatefrombmp( $full_path );
 
-	if ( ! isset( $image ) || ! $image ) {
-		return false;
-	}
-
+	if ( ! isset( $image ) || ! $image ) return new WP_Error('gd','GD failed.');
 	imagewebp( $image, $new_path, $quality );
 	imagedestroy( $image );
 
-	$new_size      = filesize( $new_path );
-	$relative_path = get_post_meta( $attachment_id, '_wp_attached_file', true );
-	$upload_dir    = wp_upload_dir();
-	$backup_dir    = $upload_dir['basedir'] . '/webp-backups/' . dirname( $relative_path );
+	$upload_dir  = wp_upload_dir();
+	$backup_base = $upload_dir['basedir'] . '/webp-backups';
+	$rel_path    = get_post_meta( $attachment_id, '_wp_attached_file', true );
+	$backup_dir  = $backup_base . '/' . dirname( $rel_path );
 
-	if ( ! $wp_fs->is_dir( $backup_dir ) ) {
-		$wp_fs->mkdir( $backup_dir, FS_CHMOD_DIR );
-	}
+	// Reliable recursive backup creation
+	if ( ! wp_mkdir_p( $backup_dir ) ) return new WP_Error('dir','Backup folder failed.');
 
 	$backup_path = $backup_dir . '/' . basename( $full_path );
 
 	if ( $wp_fs->move( $full_path, $backup_path, true ) ) {
 		update_post_meta( $attachment_id, '_webp_original_path', $backup_path );
-		update_post_meta( $attachment_id, '_webp_savings', ( $original_size - $new_size ) );
+		update_post_meta( $attachment_id, '_webp_savings', ( $original_size - filesize( $new_path ) ) );
 		return true;
 	}
-
-	return false;
+	return new WP_Error('move','Archive failed.');
 }
 
-function fwo_restore_single_image( $id ) {
-	$wp_fs        = fwo_init_filesystem();
-	$backup_path  = get_post_meta( $id, '_webp_original_path', true );
-	$current_webp = get_attached_file( $id );
+function fwo_restore_image( $attachment_id ) {
+	$wp_fs = fwo_init_filesystem();
+	$backup_path = get_post_meta( $attachment_id, '_webp_original_path', true );
 
-	if ( $backup_path && $wp_fs->exists( $backup_path ) ) {
-		if ( $wp_fs->exists( $current_webp ) ) {
-			$wp_fs->delete( $current_webp );
-		}
+	if ( ! $backup_path || 'external' === $backup_path || ! $wp_fs->exists( $backup_path ) ) return false;
+
+	$current_webp_path = get_attached_file( $attachment_id );
+	$original_ext = pathinfo( $backup_path, PATHINFO_EXTENSION );
+	$restored_path = preg_replace( '/\.webp$/i', '.' . $original_ext, $current_webp_path );
+
+	if ( $wp_fs->move( $backup_path, $restored_path, true ) ) {
+		if ( $wp_fs->exists( $current_webp_path ) ) $wp_fs->delete( $current_webp_path );
 		
-		$original_ext  = strtolower( strrchr( $backup_path, '.' ) );
-		$restored_path = preg_replace( '/\.webp$/i', $original_ext, $current_webp );
-		$backup_dir    = dirname( $backup_path );
-
-		if ( $wp_fs->move( $backup_path, $restored_path ) ) {
-			$dir_content = $wp_fs->dirlist( $backup_dir );
-			if ( empty( $dir_content ) ) {
-				$wp_fs->rmdir( $backup_dir );
-			}
-
-			$rel     = get_post_meta( $id, '_wp_attached_file', true );
-			update_post_meta( $id, '_wp_attached_file', preg_replace( '/\.webp$/i', $original_ext, $rel ) );
-			
-			wp_update_post( array(
-				'ID'             => (int) $id,
-				'post_mime_type' => ( '.png' === $original_ext ? 'image/png' : 'image/jpeg' ),
-			) );
-			
-			delete_post_meta( $id, '_webp_original_path' );
-			delete_post_meta( $id, '_webp_savings' );
-			return true;
-		}
+		$rel_path = get_post_meta( $attachment_id, '_wp_attached_file', true );
+		update_post_meta( $attachment_id, '_wp_attached_file', preg_replace( '/\.webp$/i', '.' . $original_ext, $rel_path ) );
+		
+		$mimes = array( 'jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg', 'png' => 'image/png', 'gif' => 'image/gif', 'bmp' => 'image/bmp' );
+		$mime = isset( $mimes[ strtolower( $original_ext ) ] ) ? $mimes[ strtolower( $original_ext ) ] : 'image/jpeg';
+		
+		wp_update_post( array( 'ID' => $attachment_id, 'post_mime_type' => $mime ) );
+		delete_post_meta( $attachment_id, '_webp_original_path' );
+		delete_post_meta( $attachment_id, '_webp_savings' );
+		return true;
 	}
 	return false;
 }
 
 /**
- * SECTION 3: ADMIN UI
+ * SECTION 2: ADMIN UI (Media Menu)
  */
 add_action( 'admin_menu', function() {
-	add_management_page( esc_html__( 'WebP Optimizer', 'free-webp-optimizer-thisismyurl' ), esc_html__( 'WebP Optimizer', 'free-webp-optimizer-thisismyurl' ), 'manage_options', 'webp-optimizer', 'fwo_render_admin_page' );
+	add_media_page( 'WebP Optimizer', 'WebP Optimizer', 'manage_options', 'webp-optimizer', 'fwo_render_admin_page' );
 });
 
 function fwo_render_admin_page() {
-	// Fetch optimized images via WP_Query
-	$optimized_query = new WP_Query( array(
-		'post_type'      => 'attachment',
-		'post_status'    => 'inherit',
-		'posts_per_page' => 20,
-		'post_mime_type' => 'image/webp',
-		'meta_key'       => '_webp_original_path',
-		'no_found_rows'  => true,
-	) );
-	$optimized = $optimized_query->posts;
-
-	// Calculate total saved using Metadata API (No Direct SQL)
-	$savings_query = new WP_Query( array(
-		'post_type'      => 'attachment',
-		'post_status'    => 'inherit',
-		'posts_per_page' => -1,
-		'meta_key'       => '_webp_savings',
-		'fields'         => 'ids',
-		'no_found_rows'  => true,
-	) );
-	$total_saved = 0;
-	if ( ! empty( $savings_query->posts ) ) {
-		foreach ( $savings_query->posts as $sid ) {
-			$total_saved += (int) get_post_meta( $sid, '_webp_savings', true );
-		}
+	$lists = fwo_get_media_lists();
+	$pending_ids = array_map( function($p) { return $p->ID; }, $lists['pending'] );
+	$restorable_ids = array();
+	foreach($lists['media'] as $m) {
+		$orig = get_post_meta($m->ID, '_webp_original_path', true);
+		if($orig && $orig !== 'external') $restorable_ids[] = $m->ID;
 	}
-
-	$pending_count = count( array_map( 'intval', (new WP_Query( array(
-		'post_type'      => 'attachment',
-		'post_status'    => 'inherit',
-		'posts_per_page' => -1,
-		'fields'         => 'ids',
-		'post_mime_type' => array( 'image/jpeg', 'image/png' ),
-		'no_found_rows'  => true,
-	) ))->posts ) );
-
 	?>
+	<style>
+		.webp-optimizer-wrap .welcome-panel { padding: 30px; background: #fff; border: 1px solid #c3c4c7; margin-top: 20px; }
+		.fwo-progress-container { display: none; margin-top: 20px; background: #f0f0f1; border: 1px solid #c3c4c7; height: 30px; position: relative; border-radius: 4px; overflow: hidden; }
+		.fwo-progress-bar { background: #2271b1; height: 100%; width: 0%; transition: width 0.1s linear; }
+		.fwo-progress-text { position: absolute; width: 100%; text-align: center; top: 0; line-height: 30px; font-weight: bold; color: #fff; mix-blend-mode: difference; }
+		.fwo-status-text { margin-top: 10px; font-weight: bold; display: none; }
+		.report-table-wrap { margin-top: 30px; }
+		.restore-all-wrap { margin-top: 20px; padding: 15px; background: #fff; border: 1px solid #c3c4c7; }
+	</style>
+
 	<div class="wrap webp-optimizer-wrap">
-		<h1><?php esc_html_e( 'Free WebP Optimizer', 'free-webp-optimizer-thisismyurl' ); ?> <small><?php esc_html_e( 'by thisismyurl', 'free-webp-optimizer-thisismyurl' ); ?></small></h1>
+		<h1>Free WebP Optimizer <small>by thisismyurl</small></h1>
 
 		<div class="welcome-panel">
 			<div class="welcome-panel-content">
-				<h2><?php esc_html_e( 'Total Server Space Saved:', 'free-webp-optimizer-thisismyurl' ); ?> <span class="savings-total"><?php echo esc_html( size_format( $total_saved ) ); ?></span></h2>
-				<br>
-				<button id="btn-start" class="button button-primary button-large" <?php disabled( $pending_count, 0 ); ?>>
-					<?php 
-					/* translators: %d: The number of images pending optimization */
-					printf( esc_html__( 'Optimize %d Existing Images', 'free-webp-optimizer-thisismyurl' ), (int) $pending_count ); 
-					?>
-				</button>
+				<h2>Optimization Dashboard</h2>
+				<div class="fwo-controls" style="display: flex; gap: 10px;">
+					<button id="btn-start" class="button button-primary button-large" <?php disabled( count($pending_ids), 0 ); ?>>Optimize All <?php echo count($pending_ids); ?> Images</button>
+					<button id="btn-cancel" class="button button-secondary button-large" style="display:none; color: #d63638;">Cancel Batch</button>
+				</div>
+				<div id="fwo-progress-container" class="fwo-progress-container">
+					<div id="fwo-progress-bar" class="fwo-progress-bar"></div>
+					<div id="fwo-progress-text" class="fwo-progress-text">0%</div>
+				</div>
+				<div id="fwo-status-text" class="fwo-status-text">Processing image <span id="fwo-current-idx">0</span> of <?php echo count($pending_ids); ?>...</div>
 			</div>
 		</div>
 
 		<div class="report-table-wrap">
-			<h2><?php esc_html_e( 'Recent Optimizations', 'free-webp-optimizer-thisismyurl' ); ?></h2>
-			<table class="widefat striped">
-				<thead>
-					<tr>
-						<th><?php esc_html_e( 'Preview', 'free-webp-optimizer-thisismyurl' ); ?></th>
-						<th><?php esc_html_e( 'ID', 'free-webp-optimizer-thisismyurl' ); ?></th>
-						<th><?php esc_html_e( 'Savings', 'free-webp-optimizer-thisismyurl' ); ?></th>
-						<th><?php esc_html_e( 'Action', 'free-webp-optimizer-thisismyurl' ); ?></th>
-					</tr>
-				</thead>
-				<tbody id="report-log">
-					<?php if ( $optimized ) : foreach ( $optimized as $post_obj ) : 
-						$img_id = (int) $post_obj->ID;
-						$thumb  = wp_get_attachment_image( $img_id, array( 50, 50 ) ); 
-					?>
-						<tr>
-							<td><?php echo $thumb ? wp_kses_post( $thumb ) : esc_html__( 'No Preview', 'free-webp-optimizer-thisismyurl' ); ?></td>
-							<td>#<?php echo esc_html( $img_id ); ?></td>
-							<td><?php echo esc_html( size_format( (int) get_post_meta( $img_id, '_webp_savings', true ) ) ); ?></td>
-							<td><button class="restore-btn button button-small" data-id="<?php echo esc_attr( $img_id ); ?>"><?php esc_html_e( 'Restore', 'free-webp-optimizer-thisismyurl' ); ?></button></td>
+			<h2>Pending Optimizations (Count: <span id="p-cnt"><?php echo count($pending_ids); ?></span>)</h2>
+			<table class="widefat striped" id="fwo-pending-table">
+				<thead><tr><th>Preview</th><th>ID</th><th>File Name</th></tr></thead>
+				<tbody>
+					<?php if ( $lists['pending'] ) : foreach ( $lists['pending'] as $post ) : ?>
+						<tr id="fwo-row-<?php echo esc_attr( $post->ID ); ?>">
+							<td><?php echo wp_get_attachment_image( $post->ID, array( 50, 50 ) ); ?></td>
+							<td>#<?php echo esc_html( $post->ID ); ?></td>
+							<td><?php echo esc_html( basename( get_attached_file( $post->ID ) ) ); ?></td>
 						</tr>
 					<?php endforeach; else : ?>
-						<tr><td colspan="4"><?php esc_html_e( 'No images optimized yet.', 'free-webp-optimizer-thisismyurl' ); ?></td></tr>
+						<tr class="no-images"><td colspan="3">All images optimized!</td></tr>
 					<?php endif; ?>
 				</tbody>
 			</table>
 		</div>
 
-		<div class="danger-zone" style="margin-top:50px; border:1px solid #d63638; padding:20px; background:#fff;">
-			<h3 style="color:#d63638;"><?php esc_html_e( 'Danger Zone', 'free-webp-optimizer-thisismyurl' ); ?></h3>
-			<div id="fwo-progress-container" style="display:none; margin-bottom:15px; background:#f0f0f1; border:1px solid #c3c4c7; height:25px; position:relative;">
-				<div id="fwo-progress-bar" style="background:#d63638; height:100%; width:0%;"></div>
-				<div id="fwo-progress-text" style="position:absolute; width:100%; text-align:center; top:0; line-height:25px; font-weight:bold; color:#000; mix-blend-mode:difference;">0%</div>
-			</div>
-			<div id="fwo-status-message" style="margin-bottom:10px; font-style:italic;"></div>
-			<button id="btn-rollback-all" class="button button-link-delete"><?php esc_html_e( 'Restore All & Prepare for Uninstall', 'free-webp-optimizer-thisismyurl' ); ?></button>
+		<div class="report-table-wrap">
+			<h2>Media Files (Count: <span id="m-cnt"><?php echo count($lists['media']); ?></span>)</h2>
+			<table class="widefat striped" id="fwo-media-table">
+				<thead><tr><th>Preview</th><th>ID</th><th>File Name</th><th>Action</th></tr></thead>
+				<tbody>
+					<?php if ( $lists['media'] ) : foreach ( $lists['media'] as $post ) : 
+						$orig = get_post_meta( $post->ID, '_webp_original_path', true );
+						$mime = get_post_mime_type( $post->ID );
+						$is_image = (strpos($mime, 'image/') === 0);
+						$is_webp = ($mime === 'image/webp');
+						$status = isset($post->fwo_status) ? $post->fwo_status : '';
+					?>
+						<tr id="fwo-media-row-<?php echo esc_attr( $post->ID ); ?>">
+							<td><?php echo wp_get_attachment_image( $post->ID, array( 50, 50 ) ); ?></td>
+							<td>#<?php echo esc_html( $post->ID ); ?></td>
+							<td><?php echo esc_html( basename( get_attached_file( $post->ID ) ) ); ?></td>
+							<td>
+								<?php if ( $status === 'missing' ) : ?>
+									<span class="description" style="color:#d63638;">No file to optimize</span>
+								<?php elseif ( $orig && 'external' !== $orig ) : ?>
+									<button class="restore-btn button button-small" data-id="<?php echo esc_attr( $post->ID ); ?>">Restore Original</button>
+								<?php elseif ( $is_image && !$is_webp ) : ?>
+								<?php else : ?>
+									<span class="description"><?php echo $is_webp ? 'Optimized' : 'Managed'; ?></span>
+								<?php endif; ?>
+							</td>
+						</tr>
+					<?php endforeach; else : ?>
+						<tr class="no-images"><td colspan="4">No media files found.</td></tr>
+					<?php endif; ?>
+				</tbody>
+			</table>
+
+			<?php if ( !empty($restorable_ids) ) : ?>
+				<div class="restore-all-wrap">
+					<button id="btn-restore-all" class="button button-secondary" data-ids="<?php echo esc_attr(json_encode($restorable_ids)); ?>">Restore All Optimized Images</button>
+				</div>
+			<?php endif; ?>
 		</div>
 	</div>
+
+	<script type="text/javascript">
+	jQuery(document).ready(function($) {
+		const pendingIds = <?php echo json_encode( $pending_ids ); ?>;
+		const nonce = '<?php echo wp_create_nonce( "fwo_webp_nonce" ); ?>';
+		let completed = 0;
+		let isCancelled = false;
+
+		// One-click restoration
+		$(document).on('click', '.restore-btn', function(e) {
+			const $btn = $(this);
+			$btn.attr('disabled', true).text('Working...');
+			$.post(ajaxurl, { action: 'fwo_restore_single', attachment_id: $btn.data('id'), _ajax_nonce: nonce })
+			.done(() => location.reload());
+		});
+
+		// Restore All Logic
+		$('#btn-restore-all').click(function() {
+			const ids = $(this).data('ids');
+			if(!confirm('Restore all ' + ids.length + ' images to originals?')) return;
+			$(this).attr('disabled', true).text('Restoring All...');
+			
+			const restoreBatch = () => {
+				if(!ids.length) return location.reload();
+				$.post(ajaxurl, { action: 'fwo_restore_single', attachment_id: ids.shift(), _ajax_nonce: nonce }).always(restoreBatch);
+			};
+			restoreBatch();
+		});
+
+		$('#btn-start').click(function(e) {
+			e.preventDefault();
+			if (!pendingIds.length) return;
+			const $btn = $(this);
+			const total = pendingIds.length;
+			$btn.attr('disabled', true).text('Processing...');
+			$('#btn-cancel').show();
+			$('#fwo-progress-container, #fwo-status-text').fadeIn();
+
+			function processNext() {
+				if (isCancelled || !pendingIds.length) {
+					$btn.text(isCancelled ? 'Resume' : 'Complete');
+					return;
+				}
+				const id = pendingIds.shift();
+				const row = $('#fwo-row-' + id);
+				$.post(ajaxurl, { action: 'webp_bulk_optimize', attachment_id: id, _ajax_nonce: nonce })
+				.done(function(res) {
+					if (res.success) {
+						completed++;
+						const percent = Math.round((completed / total) * 100);
+						$('#fwo-progress-bar').css('width', percent + '%');
+						$('#fwo-progress-text').text(percent + '%');
+						$('#fwo-current-idx').text(completed);
+						
+						row.fadeOut(300, function() {
+							$(this).remove();
+							const newRow = `<tr id="fwo-media-row-${id}"><td>${res.data.thumb}</td><td>#${id}</td><td>${res.data.filename}</td><td><button class="restore-btn button button-small" data-id="${id}">Restore Original</button></td></tr>`;
+							$('#fwo-media-table tbody .no-images').remove();
+							$('#fwo-media-table tbody').prepend($(newRow).hide().fadeIn(400));
+							
+							// Dynamic Count Updates
+							$('#p-cnt').text(parseInt($('#p-cnt').text()) - 1);
+							$('#m-cnt').text(parseInt($('#m-cnt').text()) + 1);
+						});
+					}
+					processNext();
+				});
+			}
+			processNext();
+		});
+
+		$('#btn-cancel').click(function() { isCancelled = true; $(this).attr('disabled', true).text('Stopping...'); });
+	});
+	</script>
 	<?php
 }
 
 /**
- * SECTION 4: AJAX ENDPOINTS
+ * SECTION 3: AJAX ENDPOINTS
  */
 add_action( 'wp_ajax_webp_bulk_optimize', function() {
 	check_ajax_referer( 'fwo_webp_nonce' );
-	$id = isset( $_POST['attachment_id'] ) ? (int) $_POST['attachment_id'] : 0;
-	if ( fwo_convert_to_webp( $id ) ) {
-		$rel = get_post_meta( $id, '_wp_attached_file', true );
-		update_post_meta( $id, '_wp_attached_file', preg_replace( '/\.(jpg|jpeg|png)$/i', '.webp', $rel ) );
+	$id = (int) $_POST['attachment_id'];
+	if ( fwo_convert_to_webp( $id ) === true ) {
+		update_post_meta( $id, '_wp_attached_file', preg_replace( '/\.(jpg|jpeg|png|gif|bmp)$/i', '.webp', get_post_meta( $id, '_wp_attached_file', true ) ) );
 		wp_update_post( array( 'ID' => $id, 'post_mime_type' => 'image/webp' ) );
-		wp_send_json_success();
+		wp_send_json_success( array( 'filename' => basename( get_attached_file( $id ) ), 'thumb' => wp_get_attachment_image( $id, array( 50, 50 ) ) ) );
 	}
 	wp_send_json_error();
 });
 
-add_action( 'wp_ajax_webp_restore', function() {
+add_action( 'wp_ajax_fwo_restore_single', function() {
 	check_ajax_referer( 'fwo_webp_nonce' );
-	$id = isset( $_POST['attachment_id'] ) ? (int) $_POST['attachment_id'] : 0;
-	if ( fwo_restore_single_image( $id ) ) {
-		wp_send_json_success();
-	}
+	if ( fwo_restore_image( (int)$_POST['attachment_id'] ) ) wp_send_json_success();
 	wp_send_json_error();
 });
 
-
-/**
- * SECTION 65: UPDATER INITIALIZATION
- */
 require_once plugin_dir_path( __FILE__ ) . 'updater.php';
-
-new FWO_GitHub_Updater( array(
-    'slug'               => 'free-webp-optimizer-thisismyurl',
-    'proper_folder_name' => 'free-webp-optimizer-thisismyurl',
-    'api_url'            => 'https://api.github.com/repos/thisismyurl/free-webp-optimizer-thisismyurl/releases/latest',
-    'github_url'         => 'https://github.com/thisismyurl/free-webp-optimizer-thisismyurl',
-    'plugin_file'        => __FILE__,
-) );
