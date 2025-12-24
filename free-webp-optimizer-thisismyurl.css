@@ -1,0 +1,7 @@
+.webp-optimizer-wrap .notice-info { border-left-color: #2271b1; padding: 15px; }
+.webp-optimizer-wrap .welcome-panel { padding: 30px; background: #fff; border: 1px solid #c3c4c7; box-shadow: none; margin-top: 20px; }
+.webp-optimizer-wrap .savings-total { color: #2271b1; font-weight: bold; }
+.webp-optimizer-wrap .quality-slider-wrap { margin: 20px 0; padding: 15px; background: #f6f7f7; border-radius: 4px; display: inline-block; }
+.webp-optimizer-wrap #webp-quality { width: 250px; vertical-align: middle; }
+.webp-optimizer-wrap #q-val { font-weight: bold; font-size: 1.3em; margin-left: 10px; }
+.webp-optimizer-wrap .footer-thanks { margin-top: 60px; padding: 30px; border-top: 1px solid #dcdcde; text-align: center; color: #646970; }
