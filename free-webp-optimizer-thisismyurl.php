@@ -275,3 +275,17 @@ add_action( 'wp_ajax_webp_restore', function() {
 	}
 	wp_send_json_error();
 });
+
+
+/**
+ * SECTION 65: UPDATER INITIALIZATION
+ */
+require_once plugin_dir_path( __FILE__ ) . 'updater.php';
+
+new FWO_GitHub_Updater( array(
+    'slug'               => 'free-webp-optimizer-thisismyurl',
+    'proper_folder_name' => 'free-webp-optimizer-thisismyurl',
+    'api_url'            => 'https://api.github.com/repos/thisismyurl/free-webp-optimizer-thisismyurl/releases/latest',
+    'github_url'         => 'https://github.com/thisismyurl/free-webp-optimizer-thisismyurl',
+    'plugin_file'        => __FILE__,
+) );
